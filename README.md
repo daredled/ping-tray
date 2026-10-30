@@ -46,6 +46,11 @@ uv run --gui-script ping_tray.py   # --gui-script = pythonw, no console window
 | `green_max_jitter_ms`  | `20`      | Maximum jitter (ms) for green                          |
 | `yellow_max_jitter_ms` | `50`      | Maximum jitter (ms) for yellow                         |
 | `notify_on_change`     | `true`    | Notify when the color changes                          |
+| `lan_enabled`          | `false`   | Discover other Ping Tray PCs on the LAN (see below)    |
+| `lan_name`             | hostname  | Name this PC is shown with to the others               |
+| `lan_port`             | `50505`   | UDP port for discovery and TCP port for speed tests    |
+| `lan_secret`           | `""`      | Shared password; peers must use the same one to test   |
+| `speedtest_seconds`    | `5`       | Duration of each direction of a speed test (max 30)    |
 
 `target` has no default and must be set. If `config.json` doesn't exist, it is created with an
 empty `target`; until you fill it in, the icon stays gray, nothing is pinged and the menu shows
@@ -86,6 +91,46 @@ the sample count of a full window (300). That way a single lost packet in the fi
 doesn't turn the icon red, but a full outage does within ~7 seconds. The tooltip still shows
 the actual loss %. Latency and jitter are evaluated only after 10 replies, so a slow first
 ping doesn't affect the color.
+
+## LAN peers and speed test
+
+With `"lan_enabled": true` on two or more PCs of the same network, each Ping Tray announces
+itself and the right-click menu gets a **LAN peers** submenu listing the others. Each peer has:
+
+- **Run speed test**: measures TCP throughput in both directions (↓ from the peer to you, ↑
+  from you to the peer, `speedtest_seconds` each) plus the latency, and shows the result as a
+  notification and in the submenu. It measures the bottleneck between both PCs (Wi-Fi of
+  either one, switch, cables), so it's handy to tell e.g. "the laptop on Wi-Fi only gets
+  200 Mbps".
+- **Ping this peer**: monitors that PC instead of `target`, with the same colors and
+  thresholds. Click it again (or reload settings with LAN off) to go back to `target`.
+
+How it works: every 3 s each instance broadcasts a UDP beacon on `lan_port`; a peer that stops
+announcing itself disappears after ~10 s. Speed tests use a TCP connection on `lan_port` (or a
+free port if it is taken, e.g. by a second instance on the same PC). Each PC serves one test
+at a time, capped at 30 s per direction. If you set `lan_secret`, only peers with the same
+secret can run tests against you.
+
+**Windows Firewall.** The first time it runs with LAN enabled, Windows asks whether to allow
+`pythonw.exe` (or `PingTray.exe`) on the network: allow it on **private networks**. The
+network must be marked as *Private* in Windows settings (on *Public* networks the firewall
+blocks discovery). If you dismissed the prompt, allow the program under *Windows Security →
+Firewall & network protection → Allow an app through firewall*. Running from source needs
+`lan.py` next to `ping_tray.py`.
+
+**Testing without a second PC.** `lan.py` also runs as a console node, with no tray icon:
+
+```powershell
+uv run lan.py                          # announce this node and print the peers it sees
+uv run lan.py --test DESKTOP-SALA      # run a speed test against a peer (name or IP) and exit
+uv run lan.py --help                   # --name, --port, --secret, --seconds
+```
+
+Run it next to the tray app on the same PC: it appears in **LAN peers** as `<hostname>-cli`,
+so you can test against it from the menu, and vice versa. It's also handy to diagnose a real
+network: if the console node sees no peers, the problem is the firewall or the broadcast,
+not the tray app. On the same PC the speeds are meaningless (the traffic never leaves the
+machine).
 
 ## Start with Windows
 
