@@ -1,7 +1,11 @@
 """LAN peers: discovery of other Ping Tray instances and speed tests between them.
 
 Discovery: every instance broadcasts a small UDP beacon every BEACON_INTERVAL_S seconds on
-lan_port and listens for the others' beacons. A peer that stops announcing itself is dropped
+lan_port and listens for the others' beacons. On the first beacon from an unknown peer it
+broadcasts its own right away, so a new instance discovers the existing ones without waiting
+for their next beacon (a broadcast rather than a reply to the peer: instances sharing a PC
+share the UDP port, and a unicast would reach only one of them). On shutdown it broadcasts a "bye" so the others
+drop it at once; a peer that just stops announcing itself (crash, network down) is dropped
 after PEER_TIMEOUT_S.
 
 Speed test: every instance runs a TCP server (on lan_port, or a free port if it is taken; the
@@ -25,8 +29,9 @@ import uuid
 from dataclasses import dataclass
 
 PROTOCOL = 1
-BEACON_INTERVAL_S = 3.0
-PEER_TIMEOUT_S = 10.0
+BEACON_INTERVAL_S = 60.0
+PEER_TIMEOUT_S = 150.0  # 2.5 beacons: tolerates one lost broadcast
+DISCOVERY_WAIT_S = 10.0  # how long the console --test waits for the peer to answer
 MAX_TEST_SECONDS = 30
 IO_TIMEOUT_S = 10.0
 HEADER_MAX_BYTES = 1024
@@ -149,6 +154,8 @@ class LanNode:
             threading.Thread(target=target, daemon=True).start()
 
     def stop(self):
+        if not self._stop.is_set() and self._udp is not None:
+            self._broadcast(self._beacon(bye=True))
         self._stop.set()
         for sock in (self._udp, self._tcp):
             if sock is not None:
@@ -173,17 +180,28 @@ class LanNode:
         sock.bind(("", self.port))
         return sock
 
-    def _beacon_loop(self):
-        beacon = json.dumps({
+    def _beacon(self, bye: bool = False) -> bytes:
+        msg = {
             "app": "ping-tray", "proto": PROTOCOL, "id": self.id,
             "name": self.name, "port": self.tcp_port, "version": self.version,
-        }).encode()
+        }
+        if bye:
+            msg["bye"] = True
+        return json.dumps(msg).encode()
+
+    def _send(self, data: bytes, addr: str):
+        try:
+            self._udp.sendto(data, (addr, self.port))
+        except OSError:
+            pass  # e.g. an adapter that went down
+
+    def _broadcast(self, data: bytes):
+        for addr in _broadcast_addresses():
+            self._send(data, addr)
+
+    def _beacon_loop(self):
         while not self._stop.is_set():
-            for addr in _broadcast_addresses():
-                try:
-                    self._udp.sendto(beacon, (addr, self.port))
-                except OSError:
-                    pass  # e.g. an adapter that went down
+            self._broadcast(self._beacon())
             self._stop.wait(BEACON_INTERVAL_S)
 
     def _listen_loop(self):
@@ -192,6 +210,10 @@ class LanNode:
                 data, (addr, _) = self._udp.recvfrom(2048)
                 msg = json.loads(data)
                 if msg.get("app") != "ping-tray" or msg.get("proto") != PROTOCOL or msg["id"] == self.id:
+                    continue
+                if msg.get("bye"):
+                    with self._lock:
+                        self._peers.pop(str(msg["id"]), None)
                     continue
                 peer = Peer(
                     id=str(msg["id"]), name=str(msg["name"])[:64], addr=addr,
@@ -205,7 +227,10 @@ class LanNode:
             except (ValueError, KeyError, TypeError, AttributeError):
                 continue  # not a beacon of ours
             with self._lock:
+                is_new = peer.id not in self._peers
                 self._peers[peer.id] = peer
+            if is_new:
+                self._broadcast(self._beacon())  # the peer is new or restarted: let it know about us
 
     # Speed test server
 
@@ -307,7 +332,7 @@ def _main():
     try:
         if args.test:
             wanted = args.test.lower()
-            deadline = time.monotonic() + PEER_TIMEOUT_S
+            deadline = time.monotonic() + DISCOVERY_WAIT_S
             while True:
                 match = [p for p in node.peers() if wanted in (p.name.lower(), p.addr)]
                 if match:

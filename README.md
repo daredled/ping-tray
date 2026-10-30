@@ -105,8 +105,10 @@ itself and the right-click menu gets a **LAN peers** submenu listing the others.
 - **Ping this peer**: monitors that PC instead of `target`, with the same colors and
   thresholds. Click it again (or reload settings with LAN off) to go back to `target`.
 
-How it works: every 3 s each instance broadcasts a UDP beacon on `lan_port`; a peer that stops
-announcing itself disappears after ~10 s. Speed tests use a TCP connection on `lan_port` (or a
+How it works: every minute each instance broadcasts a UDP beacon on `lan_port`, and answers
+right away the first beacon of a new peer, so a PC that starts Ping Tray sees the others within
+a second. On quit it says goodbye and disappears from the others' list at once; a PC that is
+turned off or loses the network disappears after ~2.5 min. Speed tests use a TCP connection on `lan_port` (or a
 free port if it is taken, e.g. by a second instance on the same PC). Each PC serves one test
 at a time, capped at 30 s per direction. If you set `lan_secret`, only peers with the same
 secret can run tests against you.

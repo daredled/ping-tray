@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw
 import lan
 
 APP_NAME = "Ping Tray"
-__version__ = "0.2.0"  # keep in sync with pyproject.toml
+__version__ = "0.2.1"  # keep in sync with pyproject.toml
 
 # "target" has no default: the host to ping must be set in config.json.
 DEFAULT_CONFIG = {
