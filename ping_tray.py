@@ -1,0 +1,455 @@
+"""System tray icon that monitors connection quality to a host.
+
+Pings the host set as "target" in config.json and shows a colored sphere based on
+packet loss, average latency and jitter over a sliding window (5 minutes by default).
+Each metric has green_max_* and yellow_max_* thresholds; the final color is the worst
+of the three:
+
+    green   every metric <= green_max_*
+    yellow  some metric  <= yellow_max_*
+    red     some metric  >  yellow_max_*
+    gray    no data yet
+
+Configuration lives in config.json next to the script (or next to the .exe).
+"""
+
+import ctypes
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+
+import pystray
+from PIL import Image, ImageDraw
+
+APP_NAME = "Ping Tray"
+__version__ = "0.1.0"  # keep in sync with pyproject.toml
+
+# "target" has no default: the host to ping must be set in config.json.
+DEFAULT_CONFIG = {
+    "interval_seconds": 1.0,
+    "timeout_ms": 1000,
+    "window_minutes": 5,
+    "green_max_loss_pct": 0.5,
+    "yellow_max_loss_pct": 2.0,
+    "green_max_rtt_ms": 100,
+    "yellow_max_rtt_ms": 250,
+    "green_max_jitter_ms": 20,
+    "yellow_max_jitter_ms": 50,
+    "notify_on_change": True,
+}
+
+# (display name, config key suffix) of each thresholded metric
+METRICS = (
+    ("loss", "loss_pct"),
+    ("latency", "rtt_ms"),
+    ("jitter", "jitter_ms"),
+)
+
+# Minimum replies before latency and jitter are evaluated, so a slow first ping
+# (ARP/DNS resolution) doesn't change the color at startup.
+MIN_LATENCY_SAMPLES = 10
+
+SEVERITY = ("green", "yellow", "red")
+
+COLORS = {
+    "green": (46, 184, 76),
+    "yellow": (240, 190, 0),
+    "red": (220, 45, 45),
+    "gray": (140, 140, 140),
+}
+
+LABELS = {
+    "green": "Stable connection",
+    "yellow": "Unstable connection",
+    "red": "Connection problems",
+    "gray": "Waiting for data",
+}
+
+
+def app_dir() -> Path:
+    if getattr(sys, "frozen", False):  # executable built with PyInstaller
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
+
+
+CONFIG_PATH = app_dir() / "config.json"
+
+
+def load_config(previous: dict | None = None) -> tuple[dict, str | None]:
+    """Returns (config, error).
+
+    On error keeps the previous config, or an idle one (empty target, no pinging) at startup.
+    If config.json doesn't exist, it is created with an empty target for the user to fill in.
+    """
+    try:
+        if not CONFIG_PATH.exists():
+            template = {"target": "", **DEFAULT_CONFIG}
+            CONFIG_PATH.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
+        user_cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        cfg = {**DEFAULT_CONFIG, **user_cfg}
+        cfg["target"] = str(cfg.get("target") or "").strip()
+        if not cfg["target"]:
+            raise ValueError('set "target" to the host to ping')
+        for key in ("interval_seconds", "window_minutes"):
+            cfg[key] = float(cfg[key])
+        cfg["timeout_ms"] = int(cfg["timeout_ms"])
+        cfg["notify_on_change"] = bool(cfg["notify_on_change"])
+        if cfg["interval_seconds"] <= 0 or cfg["window_minutes"] <= 0 or cfg["timeout_ms"] <= 0:
+            raise ValueError("interval_seconds, window_minutes and timeout_ms must be > 0")
+        for _, metric in METRICS:
+            green, yellow = f"green_max_{metric}", f"yellow_max_{metric}"
+            cfg[green], cfg[yellow] = float(cfg[green]), float(cfg[yellow])
+            if cfg[green] > cfg[yellow]:
+                raise ValueError(f"{green} cannot be greater than {yellow}")
+        return cfg, None
+    except (OSError, ValueError, TypeError, AttributeError) as e:  # JSONDecodeError subclasses ValueError
+        fallback = previous or {"target": "", **DEFAULT_CONFIG}
+        return dict(fallback), f"config.json error: {e}"
+
+
+# --- Ping -------------------------------------------------------------------
+
+
+class IP_OPTION_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("Ttl", ctypes.c_ubyte),
+        ("Tos", ctypes.c_ubyte),
+        ("Flags", ctypes.c_ubyte),
+        ("OptionsSize", ctypes.c_ubyte),
+        ("OptionsData", ctypes.c_void_p),
+    ]
+
+
+class ICMP_ECHO_REPLY(ctypes.Structure):
+    _fields_ = [
+        ("Address", ctypes.c_ulong),
+        ("Status", ctypes.c_ulong),
+        ("RoundTripTime", ctypes.c_ulong),
+        ("DataSize", ctypes.c_ushort),
+        ("Reserved", ctypes.c_ushort),
+        ("Data", ctypes.c_void_p),
+        ("Options", IP_OPTION_INFORMATION),
+    ]
+
+
+class WindowsPinger:
+    """Ping via IcmpSendEcho: needs no admin rights and doesn't depend on the Windows language."""
+
+    PAYLOAD = b"ping-tray-ping-tray-ping-tray-32"
+
+    def __init__(self):
+        lib = ctypes.windll.iphlpapi
+        lib.IcmpCreateFile.restype = ctypes.c_void_p
+        lib.IcmpCloseHandle.argtypes = [ctypes.c_void_p]
+        lib.IcmpSendEcho.argtypes = [
+            ctypes.c_void_p,  # IcmpHandle
+            ctypes.c_ulong,   # DestinationAddress
+            ctypes.c_char_p,  # RequestData
+            ctypes.c_ushort,  # RequestSize
+            ctypes.c_void_p,  # RequestOptions
+            ctypes.c_void_p,  # ReplyBuffer
+            ctypes.c_ulong,   # ReplySize
+            ctypes.c_ulong,   # Timeout
+        ]
+        lib.IcmpSendEcho.restype = ctypes.c_ulong
+        self._lib = lib
+        self._handle = lib.IcmpCreateFile()
+        self._reply_size = ctypes.sizeof(ICMP_ECHO_REPLY) + len(self.PAYLOAD) + 8 + 64
+        self._buffer = ctypes.create_string_buffer(self._reply_size)
+
+    def ping(self, host: str, timeout_ms: int) -> float | None:
+        """Returns the RTT in ms, or None if the packet was lost."""
+        try:
+            addr = socket.gethostbyname(host)
+        except OSError:
+            return None
+        dest = int.from_bytes(socket.inet_aton(addr), "little")  # network byte order in memory
+        count = self._lib.IcmpSendEcho(
+            self._handle, dest, self.PAYLOAD, len(self.PAYLOAD),
+            None, self._buffer, self._reply_size, timeout_ms,
+        )
+        if count == 0:
+            return None
+        reply = ICMP_ECHO_REPLY.from_buffer(self._buffer)
+        if reply.Status != 0:  # IP_SUCCESS
+            return None
+        return float(reply.RoundTripTime)
+
+    def close(self):
+        self._lib.IcmpCloseHandle(self._handle)
+
+
+class SubprocessPinger:
+    """Fallback for Linux (handy for testing outside Windows)."""
+
+    RTT_RE = re.compile(r"time[=<]([\d.]+)")
+
+    def ping(self, host: str, timeout_ms: int) -> float | None:
+        timeout_s = max(1, round(timeout_ms / 1000))
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", str(timeout_s), host],
+                capture_output=True, text=True, timeout=timeout_s + 2,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        match = self.RTT_RE.search(result.stdout)
+        return float(match.group(1)) if match else 0.0
+
+    def close(self):
+        pass
+
+
+# --- Statistics -------------------------------------------------------------
+
+
+@dataclass
+class Stats:
+    sent: int
+    lost: int
+    avg_rtt: float | None
+    last_rtt: float | None
+    jitter: float | None  # mean difference between consecutive RTTs
+    elapsed_s: float  # time since the first sample (to tell whether the window is full)
+
+    @property
+    def received(self) -> int:
+        return self.sent - self.lost
+
+    @property
+    def loss_pct(self) -> float:
+        return 100.0 * self.lost / self.sent if self.sent else 0.0
+
+
+class SampleWindow:
+    """Keeps ping results within a sliding time window."""
+
+    def __init__(self):
+        self._samples: deque[tuple[float, float | None]] = deque()
+        self._started: float | None = None
+        self._lock = threading.Lock()
+
+    def add(self, rtt: float | None):
+        with self._lock:
+            now = time.monotonic()
+            if self._started is None:
+                self._started = now
+            self._samples.append((now, rtt))
+
+    def clear(self):
+        with self._lock:
+            self._samples.clear()
+            self._started = None
+
+    def stats(self, window_s: float) -> Stats:
+        with self._lock:
+            now = time.monotonic()
+            cutoff = now - window_s
+            while self._samples and self._samples[0][0] < cutoff:
+                self._samples.popleft()
+            rtts = [rtt for _, rtt in self._samples]
+            elapsed = now - self._started if self._started is not None else 0.0
+        ok = [r for r in rtts if r is not None]
+        diffs = [abs(b - a) for a, b in zip(ok, ok[1:])]
+        return Stats(
+            sent=len(rtts),
+            lost=len(rtts) - len(ok),
+            avg_rtt=sum(ok) / len(ok) if ok else None,
+            last_rtt=rtts[-1] if rtts else None,
+            jitter=sum(diffs) / len(diffs) if diffs else None,
+            elapsed_s=elapsed,
+        )
+
+
+def _level(value: float, cfg: dict, metric: str) -> int:
+    if value <= cfg[f"green_max_{metric}"]:
+        return 0
+    if value <= cfg[f"yellow_max_{metric}"]:
+        return 1
+    return 2
+
+
+def classify(stats: Stats, cfg: dict) -> tuple[str, list[str]]:
+    """Returns (state, metrics responsible for that state)."""
+    if stats.sent == 0:
+        return "gray", []
+    window_s = cfg["window_minutes"] * 60
+    loss_pct = stats.loss_pct
+    if stats.elapsed_s < window_s:
+        # Until the window fills up, divide by the sample count of a full window:
+        # one lost packet at startup doesn't turn red, but a full outage does within seconds.
+        expected = window_s / cfg["interval_seconds"]
+        loss_pct = 100.0 * stats.lost / max(stats.sent, expected)
+    values = {"loss_pct": loss_pct}
+    if stats.received >= MIN_LATENCY_SAMPLES:
+        values["rtt_ms"] = stats.avg_rtt
+        if stats.jitter is not None:
+            values["jitter_ms"] = stats.jitter
+    levels = {name: _level(values[metric], cfg, metric) for name, metric in METRICS if metric in values}
+    worst = max(levels.values())
+    return SEVERITY[worst], [name for name, lvl in levels.items() if lvl == worst and lvl > 0]
+
+
+def make_icon_image(color: tuple[int, int, int], size: int = 64) -> Image.Image:
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    pad = size // 16
+    draw.ellipse((pad, pad, size - pad, size - pad), fill=color + (255,), outline=(30, 30, 30, 255), width=max(1, size // 32))
+    # Highlight to give a sphere effect
+    hl = size // 4
+    draw.ellipse((hl, hl, hl + size // 4, hl + size // 5), fill=(255, 255, 255, 110))
+    return img
+
+
+# --- Application ------------------------------------------------------------
+
+
+class PingTrayApp:
+    def __init__(self):
+        self.cfg, self.config_error = load_config()
+        self.pinger = WindowsPinger() if sys.platform == "win32" else SubprocessPinger()
+        self.samples = SampleWindow()
+        self.images = {state: make_icon_image(rgb) for state, rgb in COLORS.items()}
+        self.state = "gray"
+        self.reasons: list[str] = []
+        self.stats = Stats(0, 0, None, None, None, 0.0)
+        self.stop_event = threading.Event()
+        self._refresh_lock = threading.Lock()  # _refresh runs from the monitor and menu threads
+
+        self.icon = pystray.Icon(
+            APP_NAME,
+            icon=self.images["gray"],
+            title=f"{APP_NAME}: waiting for data",
+            menu=pystray.Menu(
+                # default=True: also runs on left-click of the tray icon
+                pystray.MenuItem(f"{APP_NAME} v{__version__}", self._show_version, default=True),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem(lambda _: self._status_line(), None, enabled=False),
+                pystray.MenuItem(lambda _: self._loss_line(), None, enabled=False),
+                pystray.MenuItem(lambda _: self._rtt_line(), None, enabled=False),
+                pystray.MenuItem(
+                    lambda _: self.config_error or "", None, enabled=False,
+                    visible=lambda _: bool(self.config_error),
+                ),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Open settings", self._open_config),
+                pystray.MenuItem("Reload settings", self._reload_config),
+                pystray.MenuItem("Quit", self._quit),
+            ),
+        )
+
+    # Menu / tooltip text
+
+    def _status_line(self) -> str:
+        if not self.cfg["target"]:
+            return "No target set in config.json"
+        reasons = f" ({', '.join(self.reasons)})" if self.reasons else ""
+        return f"{self.cfg['target']}: {LABELS[self.state]}{reasons}"
+
+    def _loss_line(self) -> str:
+        s = self.stats
+        return f"Loss: {s.loss_pct:.2f}% ({s.lost}/{s.sent}) in {self.cfg['window_minutes']:g} min"
+
+    def _rtt_line(self, with_last: bool = True) -> str:
+        s = self.stats
+        avg = f"{s.avg_rtt:.0f} ms" if s.avg_rtt is not None else "-"
+        jitter = f"{s.jitter:.0f} ms" if s.jitter is not None else "-"
+        line = f"Latency: {avg} · jitter: {jitter}"
+        if with_last:
+            line += f" · last: {s.last_rtt:.0f} ms" if s.last_rtt is not None else " · last: lost"
+        return line
+
+    def _tooltip(self) -> str:
+        # Windows caps the tooltip at 127 characters
+        return f"{self._status_line()}\n{self._loss_line()}\n{self._rtt_line(with_last=False)}"[:127]
+
+    # Menu actions
+
+    def _show_version(self, icon, item):
+        try:
+            icon.notify(
+                f"{self._status_line()}\n{self._loss_line()}\n{self._rtt_line()}",
+                f"{APP_NAME} v{__version__}",
+            )
+        except Exception:
+            pass  # some backends don't support notifications
+
+    def _open_config(self, icon, item):
+        if sys.platform == "win32":
+            os.startfile(CONFIG_PATH)
+        else:
+            subprocess.Popen(["xdg-open", str(CONFIG_PATH)])
+
+    def _reload_config(self, icon, item):
+        old_target = self.cfg["target"]
+        self.cfg, self.config_error = load_config(self.cfg)
+        if self.cfg["target"] != old_target:
+            self.samples.clear()
+        self._refresh()
+
+    def _quit(self, icon, item):
+        self.stop_event.set()
+        icon.stop()
+
+    # Monitoring loop
+
+    def _refresh(self):
+        with self._refresh_lock:
+            cfg = self.cfg
+            self.stats = self.samples.stats(cfg["window_minutes"] * 60)
+            new_state, self.reasons = classify(self.stats, cfg)
+            if new_state != self.state:
+                old_state, self.state = self.state, new_state
+                self.icon.icon = self.images[new_state]
+                # Skip the expected gray -> green at startup, but report problems found then
+                if cfg["notify_on_change"] and not (old_state == "gray" and new_state == "green"):
+                    try:
+                        self.icon.notify(f"{self._loss_line()}\n{self._rtt_line()}", self._status_line())
+                    except Exception:
+                        pass  # some backends don't support notifications
+            self.icon.title = self._tooltip()
+            self.icon.update_menu()
+
+    def _monitor_loop(self):
+        next_run = time.monotonic()
+        while not self.stop_event.is_set():
+            cfg = self.cfg
+            try:
+                if cfg["target"]:  # idle until a target is set and settings are reloaded
+                    self.samples.add(self.pinger.ping(cfg["target"], cfg["timeout_ms"]))
+                self._refresh()
+            except Exception:
+                # Keep monitoring: if this thread died the icon would freeze on its last color
+                traceback.print_exc()
+            next_run += cfg["interval_seconds"]
+            delay = next_run - time.monotonic()
+            if delay < 0:  # the ping took longer than the interval
+                next_run = time.monotonic()
+                delay = 0
+            self.stop_event.wait(delay)
+
+    def _setup(self, icon):
+        icon.visible = True
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
+
+    def run(self):
+        try:
+            self.icon.run(setup=self._setup)
+        finally:
+            self.stop_event.set()
+            self.pinger.close()
+
+
+if __name__ == "__main__":
+    PingTrayApp().run()

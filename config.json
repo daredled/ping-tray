@@ -1,0 +1,13 @@
+{
+  "target": "8.8.8.8",
+  "interval_seconds": 1.0,
+  "timeout_ms": 1000,
+  "window_minutes": 5,
+  "green_max_loss_pct": 0.5,
+  "yellow_max_loss_pct": 2.0,
+  "green_max_rtt_ms": 100,
+  "yellow_max_rtt_ms": 250,
+  "green_max_jitter_ms": 20,
+  "yellow_max_jitter_ms": 50,
+  "notify_on_change": true
+}
