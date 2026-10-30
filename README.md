@@ -138,3 +138,7 @@ Always keep the same path so Windows remembers that the icon should stay visible
 **Antivirus:** PyInstaller `--onefile` executables sometimes trigger false positives in
 Windows Defender. If it gets blocked, build without `--onefile` (which produces a
 `dist\PingTray\` folder with the `.exe` and its files) or add an exclusion for that folder.
+
+## License
+
+[MIT](LICENSE)
