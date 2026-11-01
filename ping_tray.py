@@ -30,10 +30,12 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
+import i18n
 import lan
+from i18n import LocalizedError, t
 
 APP_NAME = "Ping Tray"
-__version__ = "0.2.2"  # keep in sync with pyproject.toml
+__version__ = "0.3.0"  # keep in sync with pyproject.toml
 
 # "target" has no default: the host to ping must be set in config.json.
 DEFAULT_CONFIG = {
@@ -52,6 +54,7 @@ DEFAULT_CONFIG = {
     "lan_port": 50505,
     "lan_secret": "",
     "speedtest_seconds": 5,
+    "language": "",  # empty = the OS display language
 }
 
 LAN_KEYS = ("lan_enabled", "lan_name", "lan_port", "lan_secret")
@@ -59,7 +62,7 @@ LAN_KEYS = ("lan_enabled", "lan_name", "lan_port", "lan_secret")
 # Pings sent to a peer to report its latency along with the speed test
 SPEEDTEST_PINGS = 5
 
-# (display name, config key suffix) of each thresholded metric
+# (name, config key suffix) of each thresholded metric; the name is translated as metric_<name>
 METRICS = (
     ("loss", "loss_pct"),
     ("latency", "rtt_ms"),
@@ -82,13 +85,6 @@ COLORS = {
     "gray": (140, 140, 140),
 }
 
-LABELS = {
-    "green": "Stable connection",
-    "yellow": "Unstable connection",
-    "red": "Connection problems",
-    "gray": "Waiting for data",
-}
-
 
 def app_dir() -> Path:
     if getattr(sys, "frozen", False):  # executable built with PyInstaller
@@ -99,7 +95,7 @@ def app_dir() -> Path:
 CONFIG_PATH = app_dir() / "config.json"
 
 
-def load_config(previous: dict | None = None) -> tuple[dict, str | None]:
+def load_config(previous: dict | None = None) -> tuple[dict, Exception | None]:
     """Returns (config, error).
 
     On error keeps the previous config, or an idle one (empty target, no pinging) at startup.
@@ -118,26 +114,27 @@ def load_config(previous: dict | None = None) -> tuple[dict, str | None]:
         cfg["timeout_ms"] = int(cfg["timeout_ms"])
         cfg["notify_on_change"] = bool(cfg["notify_on_change"])
         if cfg["interval_seconds"] <= 0 or cfg["window_minutes"] <= 0 or cfg["timeout_ms"] <= 0:
-            raise ValueError("interval_seconds, window_minutes and timeout_ms must be > 0")
+            raise LocalizedError("cfg_positive")
         for _, metric in METRICS:
             green, yellow = f"green_max_{metric}", f"yellow_max_{metric}"
             cfg[green], cfg[yellow] = float(cfg[green]), float(cfg[yellow])
             if cfg[green] > cfg[yellow]:
-                raise ValueError(f"{green} cannot be greater than {yellow}")
+                raise LocalizedError("cfg_thresholds", green=green, yellow=yellow)
         cfg["lan_enabled"] = bool(cfg["lan_enabled"])
         cfg["lan_name"] = str(cfg["lan_name"] or "").strip() or socket.gethostname()
         cfg["lan_port"] = int(cfg["lan_port"])
         cfg["lan_secret"] = str(cfg["lan_secret"] or "")
+        cfg["language"] = str(cfg["language"] or "").strip()
         if not 1 <= cfg["lan_port"] <= 65535:
-            raise ValueError("lan_port must be between 1 and 65535")
+            raise LocalizedError("cfg_lan_port")
         if not 0 < cfg["speedtest_seconds"] <= lan.MAX_TEST_SECONDS:
-            raise ValueError(f"speedtest_seconds must be > 0 and <= {lan.MAX_TEST_SECONDS}")
+            raise LocalizedError("cfg_speedtest", max=lan.MAX_TEST_SECONDS)
         if not cfg["target"]:
-            return cfg, 'config.json error: set "target" to the host to ping'
+            return cfg, LocalizedError("cfg_target")
         return cfg, None
     except (OSError, ValueError, TypeError, AttributeError) as e:  # JSONDecodeError subclasses ValueError
         fallback = previous or {"target": "", **DEFAULT_CONFIG}
-        return dict(fallback), f"config.json error: {e}"
+        return dict(fallback), e
 
 
 # --- Ping -------------------------------------------------------------------
@@ -355,6 +352,7 @@ def make_icon_image(color: tuple[int, int, int], size: int = 64) -> Image.Image:
 class PingTrayApp:
     def __init__(self):
         self.cfg, self.config_error = load_config()
+        i18n.set_language(self.cfg["language"])
         self.pinger = WindowsPinger() if sys.platform == "win32" else SubprocessPinger()
         self.samples = SampleWindow()
         self.images = {state: make_icon_image(rgb) for state, rgb in COLORS.items()}
@@ -371,7 +369,7 @@ class PingTrayApp:
         self.icon = pystray.Icon(
             APP_NAME,
             icon=self.images["gray"],
-            title=f"{APP_NAME}: waiting for data",
+            title=t("waiting_title", app=APP_NAME),
             menu=pystray.Menu(
                 # default=True: also runs on left-click of the tray icon
                 pystray.MenuItem(f"{APP_NAME} v{__version__}", self._show_version, default=True),
@@ -381,17 +379,17 @@ class PingTrayApp:
                 pystray.MenuItem(lambda _: self._history_loss_line(), None, enabled=False),
                 pystray.MenuItem(lambda _: self._rtt_line(), None, enabled=False),
                 pystray.MenuItem(
-                    lambda _: self.config_error or "", None, enabled=False,
+                    lambda _: self._config_error_line(), None, enabled=False,
                     visible=lambda _: bool(self.config_error),
                 ),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem(
-                    "LAN peers", pystray.Menu(self._peer_items),
+                    lambda _: t("menu_lan_peers"), pystray.Menu(self._peer_items),
                     visible=lambda _: self.cfg["lan_enabled"],
                 ),
-                pystray.MenuItem("Open settings", self._open_config),
-                pystray.MenuItem("Reload settings", self._reload_config),
-                pystray.MenuItem("Quit", self._quit),
+                pystray.MenuItem(lambda _: t("menu_open_settings"), self._open_config),
+                pystray.MenuItem(lambda _: t("menu_reload_settings"), self._reload_config),
+                pystray.MenuItem(lambda _: t("menu_quit"), self._quit),
             ),
         )
 
@@ -400,60 +398,71 @@ class PingTrayApp:
     def _target(self) -> str:
         return self.ping_peer.addr if self.ping_peer else self.cfg["target"]
 
-    def _status_line(self) -> str:
+    def _status_line(self, with_reasons: bool = True) -> str:
         if not self._target():
-            return "No target set in config.json"
-        name = f"{self.ping_peer.name} (LAN)" if self.ping_peer else self.cfg["target"]
-        reasons = f" ({', '.join(self.reasons)})" if self.reasons else ""
-        return f"{name}: {LABELS[self.state]}{reasons}"
+            return t("no_target")
+        name = t("lan_target", name=self.ping_peer.name) if self.ping_peer else self.cfg["target"]
+        line = f"{name}: {t(f'state_{self.state}')}"
+        if with_reasons and self.reasons:
+            line += f" ({', '.join(t(f'metric_{r}') for r in self.reasons)})"
+        return line
+
+    def _config_error_line(self) -> str:
+        return t("config_error", error=i18n.error_text(self.config_error)) if self.config_error else ""
 
     def _loss_line(self) -> str:
         s = self.stats
-        return f"Loss: {s.loss_pct:.2f}% ({s.lost}/{s.sent}) in {self.cfg['window_minutes']:g} min"
+        return t("loss_window", pct=s.loss_pct, lost=s.lost, sent=s.sent, minutes=self.cfg["window_minutes"])
 
     def _history_loss_line(self) -> str:
         s = self.stats
-        return f"Loss: {s.history_loss_pct:.2f}% ({s.history_lost}/{s.history_sent}) in the last hour"
+        return t("loss_hour", pct=s.history_loss_pct, lost=s.history_lost, sent=s.history_sent)
 
     def _rtt_line(self, with_last: bool = True) -> str:
         s = self.stats
         avg = f"{s.avg_rtt:.0f} ms" if s.avg_rtt is not None else "-"
         jitter = f"{s.jitter:.0f} ms" if s.jitter is not None else "-"
-        line = f"Latency: {avg} · jitter: {jitter}"
+        line = t("latency_line", avg=avg, jitter=jitter)
         if with_last:
-            line += f" · last: {s.last_rtt:.0f} ms" if s.last_rtt is not None else " · last: lost"
+            last = f"{s.last_rtt:.0f} ms" if s.last_rtt is not None else t("lost")
+            line += " · " + t("last_rtt", value=last)
         return line
 
     def _tooltip(self) -> str:
-        # Windows caps the tooltip at 127 characters, so the hourly loss goes without the counts
-        loss = f"{self._loss_line()} · 1 h: {self.stats.history_loss_pct:.2f}%"
-        return f"{self._status_line()}\n{loss}\n{self._rtt_line(with_last=False)}"[:127]
+        # Windows caps the tooltip at 127 characters, so the hourly loss goes without the counts,
+        # and the reasons are dropped if it still doesn't fit (e.g. all three, in Spanish)
+        loss = f"{self._loss_line()} · {t('loss_hour_short', pct=self.stats.history_loss_pct)}"
+        rest = f"\n{loss}\n{self._rtt_line(with_last=False)}"
+        tooltip = self._status_line() + rest
+        if len(tooltip) > 127:
+            tooltip = self._status_line(with_reasons=False) + rest
+        return tooltip[:127]
 
     def _peer_items(self):
         node = self.lan_node
         if node is None:
-            yield pystray.MenuItem("LAN not started", None, enabled=False)
+            yield pystray.MenuItem(t("lan_not_started"), None, enabled=False)
             return
         if node.error:
-            yield pystray.MenuItem(node.error, None, enabled=False)
+            yield pystray.MenuItem(t("lan_disabled", error=node.error), None, enabled=False)
             return
-        yield pystray.MenuItem(f"This PC: {node.name}", None, enabled=False)
+        yield pystray.MenuItem(t("this_pc", name=node.name), None, enabled=False)
         peers = node.peers()
         if not peers:
-            yield pystray.MenuItem("No peers found yet", None, enabled=False)
+            yield pystray.MenuItem(t("no_peers"), None, enabled=False)
         for peer in peers:
             yield pystray.MenuItem(f"{peer.name} ({peer.addr})", pystray.Menu(*self._peer_actions(peer)))
 
     def _peer_actions(self, peer: lan.Peer) -> list[pystray.MenuItem]:
         testing = peer.id in self.testing
-        status = "Testing…" if testing else self.peer_results.get(peer.id)
+        status = t("testing") if testing else self.peer_results.get(peer.id)
         items = [pystray.MenuItem(status, None, enabled=False)] if status else []
         return items + [
             pystray.MenuItem(
-                "Run speed test", lambda icon, item: self._start_speed_test(peer), enabled=not testing,
+                t("run_speed_test"), lambda icon, item: self._start_speed_test(peer), enabled=not testing,
             ),
             pystray.MenuItem(
-                "Ping this peer", lambda icon, item: self._toggle_ping_peer(peer),
+                t("ping_peer"), lambda icon, item: self._toggle_ping_peer(peer),
                 checked=lambda _: self.ping_peer is not None and self.ping_peer.id == peer.id,
             ),
         ]
@@ -478,6 +487,7 @@ class PingTrayApp:
     def _reload_config(self, icon, item):
         old_cfg, old_target = self.cfg, self._target()
         self.cfg, self.config_error = load_config(self.cfg)
+        i18n.set_language(self.cfg["language"])
         if any(self.cfg[key] != old_cfg[key] for key in LAN_KEYS):
             self._restart_lan()
         if self._target() != old_target:
@@ -522,14 +532,17 @@ class PingTrayApp:
             result = lan.speed_test(peer, cfg["speedtest_seconds"], cfg["lan_secret"])
             ok = [r for r in rtts if r is not None]
             avg = sum(ok) / len(ok) if ok else None
-            latency = "ping lost" if avg is None else "<1 ms" if avg < 1 else f"{avg:.0f} ms"
+            latency = t("ping_lost") if avg is None else "<1 ms" if avg < 1 else f"{avg:.0f} ms"
             text = f"↓ {_fmt_mbps(result.down_mbps)} · ↑ {_fmt_mbps(result.up_mbps)} · {latency}"
+        except lan.RefusedError as e:
+            key = f"refused_{e.code}"
+            text = t("test_failed", error=t(key) if i18n.has(key) else str(e))
         except Exception as e:  # report any failure instead of leaving the peer stuck in "Testing…"
-            text = f"Test failed: {e}"
+            text = t("test_failed", error=e)
         self.peer_results[peer.id] = text
         self.testing.discard(peer.id)
         try:
-            self.icon.notify(text, f"Speed test: {peer.name}")
+            self.icon.notify(text, t("speed_test_title", name=peer.name))
         except Exception:
             pass  # some backends don't support notifications
         self.icon.update_menu()

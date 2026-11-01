@@ -39,6 +39,14 @@ CHUNK = bytes(256 * 1024)
 SOCK_BUFFER = 1024 * 1024
 
 
+class RefusedError(ConnectionError):
+    """The peer declined the test; code is one of "secret", "busy", "bad_request"."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass
 class Peer:
     id: str
@@ -147,7 +155,7 @@ class LanNode:
             self.tcp_port = self._tcp.getsockname()[1]
             self._udp = self._open_udp()
         except OSError as e:
-            self.error = f"LAN disabled: {e}"
+            self.error = str(e)
             self.stop()
             return
         for target in (self._beacon_loop, self._listen_loop, self._accept_loop):
@@ -262,13 +270,13 @@ class LanNode:
                 mode = header.get("mode")
                 seconds = min(float(header.get("seconds", 5)), MAX_TEST_SECONDS)
                 if not hmac.compare_digest(str(header.get("secret", "")).encode(), self.secret.encode()):
-                    _send_line(conn, {"ok": False, "error": "wrong lan_secret"})
+                    _send_line(conn, {"ok": False, "code": "secret", "error": "wrong lan_secret"})
                     return
                 if mode not in ("download", "upload") or seconds <= 0:
-                    _send_line(conn, {"ok": False, "error": "bad request"})
+                    _send_line(conn, {"ok": False, "code": "bad_request", "error": "bad request"})
                     return
                 if not self._busy.acquire(blocking=False):
-                    _send_line(conn, {"ok": False, "error": "busy with another test"})
+                    _send_line(conn, {"ok": False, "code": "busy", "error": "busy with another test"})
                     return
                 try:
                     _send_line(conn, {"ok": True})
@@ -290,7 +298,7 @@ def _request(peer: Peer, mode: str, seconds: float, secret: str) -> socket.socke
         _send_line(sock, {"mode": mode, "seconds": seconds, "secret": secret})
         reply = _recv_line(sock)
         if not reply.get("ok"):
-            raise ConnectionError(reply.get("error", "refused"))
+            raise RefusedError(str(reply.get("code", "")), str(reply.get("error", "refused")))
         return sock
     except BaseException:
         sock.close()
@@ -327,7 +335,7 @@ def _main():
     node = LanNode(args.name, args.port, args.secret, "cli")
     node.start()
     if node.error:
-        sys.exit(node.error)
+        sys.exit(f"LAN disabled: {node.error}")
     print(f"{args.name}: discovery on UDP {args.port}, speed tests on TCP {node.tcp_port}. Ctrl+C to quit.", flush=True)
     try:
         if args.test:

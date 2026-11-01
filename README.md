@@ -53,6 +53,7 @@ uv run --gui-script ping_tray.py   # --gui-script = pythonw, no console window
 | `lan_port`             | `50505`   | UDP port for discovery and TCP port for speed tests    |
 | `lan_secret`           | `""`      | Shared password; peers must use the same one to test   |
 | `speedtest_seconds`    | `5`       | Duration of each direction of a speed test (max 30)    |
+| `language`             | `""`      | `en` or `es`; empty = the Windows display language     |
 
 `target` has no default and must be set. If `config.json` doesn't exist, it is created with an
 empty `target`; until you fill it in, the icon stays gray, nothing is pinged and the menu shows
@@ -93,6 +94,15 @@ the sample count of a full window (300). That way a single lost packet in the fi
 doesn't turn the icon red, but a full outage does within ~7 seconds. The tooltip still shows
 the actual loss %. Latency and jitter are evaluated only after 10 replies, so a slow first
 ping doesn't affect the color.
+
+## Languages
+
+The app is available in English and Spanish. At startup it uses the Windows display language
+(*Settings → Time & language → Language*), falling back to English if that language isn't
+available. Set `language` in `config.json` to force one.
+
+Translations live in `i18n.py`: to add a language, copy the `"en"` dict under the new
+language code (e.g. `"pt"`) and translate the values. Missing keys fall back to English.
 
 ## LAN peers and speed test
 
