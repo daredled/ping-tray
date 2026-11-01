@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw
 import lan
 
 APP_NAME = "Ping Tray"
-__version__ = "0.2.1"  # keep in sync with pyproject.toml
+__version__ = "0.2.2"  # keep in sync with pyproject.toml
 
 # "target" has no default: the host to ping must be set in config.json.
 DEFAULT_CONFIG = {
@@ -69,6 +69,9 @@ METRICS = (
 # Minimum replies before latency and jitter are evaluated, so a slow first ping
 # (ARP/DNS resolution) doesn't change the color at startup.
 MIN_LATENCY_SAMPLES = 10
+
+# Loss over this longer period is shown alongside the window's, for context only (not used for the color)
+LOSS_HISTORY_S = 3600
 
 SEVERITY = ("green", "yellow", "red")
 
@@ -243,6 +246,8 @@ class Stats:
     last_rtt: float | None
     jitter: float | None  # mean difference between consecutive RTTs
     elapsed_s: float  # time since the first sample (to tell whether the window is full)
+    history_sent: int = 0  # over the last LOSS_HISTORY_S
+    history_lost: int = 0
 
     @property
     def received(self) -> int:
@@ -252,9 +257,13 @@ class Stats:
     def loss_pct(self) -> float:
         return 100.0 * self.lost / self.sent if self.sent else 0.0
 
+    @property
+    def history_loss_pct(self) -> float:
+        return 100.0 * self.history_lost / self.history_sent if self.history_sent else 0.0
+
 
 class SampleWindow:
-    """Keeps ping results within a sliding time window."""
+    """Keeps ping results for the sliding window and for LOSS_HISTORY_S, whichever is longer."""
 
     def __init__(self):
         self._samples: deque[tuple[float, float | None]] = deque()
@@ -276,10 +285,11 @@ class SampleWindow:
     def stats(self, window_s: float) -> Stats:
         with self._lock:
             now = time.monotonic()
-            cutoff = now - window_s
-            while self._samples and self._samples[0][0] < cutoff:
+            history_cutoff = now - max(window_s, LOSS_HISTORY_S)
+            while self._samples and self._samples[0][0] < history_cutoff:
                 self._samples.popleft()
-            rtts = [rtt for _, rtt in self._samples]
+            history = [rtt for _, rtt in self._samples]
+            rtts = [rtt for t, rtt in self._samples if t >= now - window_s]
             elapsed = now - self._started if self._started is not None else 0.0
         ok = [r for r in rtts if r is not None]
         diffs = [abs(b - a) for a, b in zip(ok, ok[1:])]
@@ -290,6 +300,8 @@ class SampleWindow:
             last_rtt=rtts[-1] if rtts else None,
             jitter=sum(diffs) / len(diffs) if diffs else None,
             elapsed_s=elapsed,
+            history_sent=len(history),
+            history_lost=history.count(None),
         )
 
 
@@ -366,6 +378,7 @@ class PingTrayApp:
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem(lambda _: self._status_line(), None, enabled=False),
                 pystray.MenuItem(lambda _: self._loss_line(), None, enabled=False),
+                pystray.MenuItem(lambda _: self._history_loss_line(), None, enabled=False),
                 pystray.MenuItem(lambda _: self._rtt_line(), None, enabled=False),
                 pystray.MenuItem(
                     lambda _: self.config_error or "", None, enabled=False,
@@ -398,6 +411,10 @@ class PingTrayApp:
         s = self.stats
         return f"Loss: {s.loss_pct:.2f}% ({s.lost}/{s.sent}) in {self.cfg['window_minutes']:g} min"
 
+    def _history_loss_line(self) -> str:
+        s = self.stats
+        return f"Loss: {s.history_loss_pct:.2f}% ({s.history_lost}/{s.history_sent}) in the last hour"
+
     def _rtt_line(self, with_last: bool = True) -> str:
         s = self.stats
         avg = f"{s.avg_rtt:.0f} ms" if s.avg_rtt is not None else "-"
@@ -408,8 +425,9 @@ class PingTrayApp:
         return line
 
     def _tooltip(self) -> str:
-        # Windows caps the tooltip at 127 characters
-        return f"{self._status_line()}\n{self._loss_line()}\n{self._rtt_line(with_last=False)}"[:127]
+        # Windows caps the tooltip at 127 characters, so the hourly loss goes without the counts
+        loss = f"{self._loss_line()} · 1 h: {self.stats.history_loss_pct:.2f}%"
+        return f"{self._status_line()}\n{loss}\n{self._rtt_line(with_last=False)}"[:127]
 
     def _peer_items(self):
         node = self.lan_node
@@ -445,7 +463,7 @@ class PingTrayApp:
     def _show_version(self, icon, item):
         try:
             icon.notify(
-                f"{self._status_line()}\n{self._loss_line()}\n{self._rtt_line()}",
+                f"{self._status_line()}\n{self._loss_line()}\n{self._history_loss_line()}\n{self._rtt_line()}",
                 f"{APP_NAME} v{__version__}",
             )
         except Exception:
@@ -533,7 +551,10 @@ class PingTrayApp:
                 # Skip the expected gray -> green at startup, but report problems found then
                 if cfg["notify_on_change"] and not (old_state == "gray" and new_state == "green"):
                     try:
-                        self.icon.notify(f"{self._loss_line()}\n{self._rtt_line()}", self._status_line())
+                        self.icon.notify(
+                            f"{self._loss_line()}\n{self._history_loss_line()}\n{self._rtt_line()}",
+                            self._status_line(),
+                        )
                     except Exception:
                         pass  # some backends don't support notifications
             self.icon.title = self._tooltip()

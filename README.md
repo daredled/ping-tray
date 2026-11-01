@@ -14,6 +14,8 @@ The final color is the worst of the three metrics, and the status line names the
 responsible, e.g. `<target>: Unstable connection (jitter)`.
 
 Hovering shows the host, the loss % (lost/sent), the average latency and the jitter.
+The loss over the last hour is also shown for context (tooltip, menu and notifications), but
+the color is based only on the sliding window.
 Left-clicking shows a notification with the app version and the current stats.
 Right-clicking shows the version, the same data plus the last RTT, and options to open/reload
 the settings and quit.
