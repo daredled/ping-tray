@@ -16,6 +16,14 @@ responsible, e.g. `<target>: Unstable connection (jitter)`.
 Hovering shows the host, the loss % (lost/sent), the average latency and the jitter.
 The loss over the last hour is also shown for context (tooltip, menu and notifications), but
 the color is based only on the sliding window.
+
+**Outages.** A run of `outage_min_lost` or more consecutive lost pings (3 s at the default
+interval) counts as an outage, lasting from the first lost ping to the next reply. The menu
+shows how many there were in the last hour and when the latest one happened and how long it
+lasted (e.g. `Outages in the last hour: 2 · last: 12 min ago, lasted 8 s`), or the running
+duration while one is in progress. Loss % alone can't tell ten scattered lost packets from a
+single 10-second drop, which is what breaks a call. Like the hourly loss, it doesn't affect
+the color.
 Left-clicking shows a notification with the app version and the current stats.
 Right-clicking shows the version, the same data plus the last RTT, and options to open/reload
 the settings and quit.
@@ -54,6 +62,7 @@ uv run --gui-script ping_tray.py   # --gui-script = pythonw, no console window
 | `lan_secret`           | `""`      | Shared password; peers must use the same one to test   |
 | `speedtest_seconds`    | `5`       | Duration of each direction of a speed test (max 30)    |
 | `language`             | `""`      | `en` or `es`; empty = the Windows display language     |
+| `outage_min_lost`      | `3`       | Consecutive lost pings that count as an outage         |
 
 `target` has no default and must be set. If `config.json` doesn't exist, it is created with an
 empty `target`; until you fill it in, the icon stays gray, nothing is pinged and the menu shows

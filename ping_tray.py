@@ -35,7 +35,7 @@ import lan
 from i18n import LocalizedError, t
 
 APP_NAME = "Ping Tray"
-__version__ = "0.3.0"  # keep in sync with pyproject.toml
+__version__ = "0.4.0"  # keep in sync with pyproject.toml
 
 # "target" has no default: the host to ping must be set in config.json.
 DEFAULT_CONFIG = {
@@ -54,6 +54,7 @@ DEFAULT_CONFIG = {
     "lan_port": 50505,
     "lan_secret": "",
     "speedtest_seconds": 5,
+    "outage_min_lost": 3,
     "language": "",  # empty = the OS display language
 }
 
@@ -112,6 +113,9 @@ def load_config(previous: dict | None = None) -> tuple[dict, Exception | None]:
         for key in ("interval_seconds", "window_minutes", "speedtest_seconds"):
             cfg[key] = float(cfg[key])
         cfg["timeout_ms"] = int(cfg["timeout_ms"])
+        cfg["outage_min_lost"] = int(cfg["outage_min_lost"])
+        if cfg["outage_min_lost"] < 1:
+            raise LocalizedError("cfg_outage_min_lost")
         cfg["notify_on_change"] = bool(cfg["notify_on_change"])
         if cfg["interval_seconds"] <= 0 or cfg["window_minutes"] <= 0 or cfg["timeout_ms"] <= 0:
             raise LocalizedError("cfg_positive")
@@ -245,6 +249,10 @@ class Stats:
     elapsed_s: float  # time since the first sample (to tell whether the window is full)
     history_sent: int = 0  # over the last LOSS_HISTORY_S
     history_lost: int = 0
+    outages: int = 0  # runs of >= outage_min_lost consecutive lost pings in the last LOSS_HISTORY_S
+    outage_ongoing: bool = False
+    last_outage_s: float | None = None  # duration of the latest outage (so far, if ongoing)
+    last_outage_ago_s: float | None = None  # time since it ended
 
     @property
     def received(self) -> int:
@@ -279,15 +287,23 @@ class SampleWindow:
             self._samples.clear()
             self._started = None
 
-    def stats(self, window_s: float) -> Stats:
+    def stats(self, window_s: float, outage_min_lost: int = 3) -> Stats:
         with self._lock:
             now = time.monotonic()
             history_cutoff = now - max(window_s, LOSS_HISTORY_S)
             while self._samples and self._samples[0][0] < history_cutoff:
                 self._samples.popleft()
-            history = [rtt for _, rtt in self._samples]
+            history = [(t, rtt) for t, rtt in self._samples if t >= now - LOSS_HISTORY_S]
             rtts = [rtt for t, rtt in self._samples if t >= now - window_s]
             elapsed = now - self._started if self._started is not None else 0.0
+        outages = _find_outages(history, outage_min_lost)
+        ongoing = bool(outages) and outages[-1][1] is None
+        if outages:
+            start, end = outages[-1]
+            last_outage_s = (end or now) - start
+            last_outage_ago_s = now - end if end is not None else 0.0
+        else:
+            last_outage_s = last_outage_ago_s = None
         ok = [r for r in rtts if r is not None]
         diffs = [abs(b - a) for a, b in zip(ok, ok[1:])]
         return Stats(
@@ -298,8 +314,33 @@ class SampleWindow:
             jitter=sum(diffs) / len(diffs) if diffs else None,
             elapsed_s=elapsed,
             history_sent=len(history),
-            history_lost=history.count(None),
+            history_lost=sum(rtt is None for _, rtt in history),
+            outages=len(outages),
+            outage_ongoing=ongoing,
+            last_outage_s=last_outage_s,
+            last_outage_ago_s=last_outage_ago_s,
         )
+
+
+def _find_outages(samples: list[tuple[float, float | None]], min_lost: int) -> list[tuple[float, float | None]]:
+    """(start, end) of each run of >= min_lost consecutive lost pings; end is None if ongoing.
+
+    An outage runs from its first lost ping to the next reply.
+    """
+    outages = []
+    run_start, run_len = 0.0, 0
+    for t, rtt in samples:
+        if rtt is None:
+            if run_len == 0:
+                run_start = t
+            run_len += 1
+        else:
+            if run_len >= min_lost:
+                outages.append((run_start, t))
+            run_len = 0
+    if run_len >= min_lost:
+        outages.append((run_start, None))
+    return outages
 
 
 def _level(value: float, cfg: dict, metric: str) -> int:
@@ -329,6 +370,15 @@ def classify(stats: Stats, cfg: dict) -> tuple[str, list[str]]:
     levels = {name: _level(values[metric], cfg, metric) for name, metric in METRICS if metric in values}
     worst = max(levels.values())
     return SEVERITY[worst], [name for name, lvl in levels.items() if lvl == worst and lvl > 0]
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = round(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min"
+    return f"{seconds // 3600} h {seconds % 3600 // 60} min"
 
 
 def _fmt_mbps(mbps: float) -> str:
@@ -377,6 +427,7 @@ class PingTrayApp:
                 pystray.MenuItem(lambda _: self._status_line(), None, enabled=False),
                 pystray.MenuItem(lambda _: self._loss_line(), None, enabled=False),
                 pystray.MenuItem(lambda _: self._history_loss_line(), None, enabled=False),
+                pystray.MenuItem(lambda _: self._outages_line(), None, enabled=False),
                 pystray.MenuItem(lambda _: self._rtt_line(), None, enabled=False),
                 pystray.MenuItem(
                     lambda _: self._config_error_line(), None, enabled=False,
@@ -418,6 +469,17 @@ class PingTrayApp:
         s = self.stats
         return t("loss_hour", pct=s.history_loss_pct, lost=s.history_lost, sent=s.history_sent)
 
+    def _outages_line(self) -> str:
+        s = self.stats
+        if s.outage_ongoing:
+            return t("outage_ongoing", duration=_fmt_duration(s.last_outage_s), count=s.outages)
+        if not s.outages:
+            return t("outages_none")
+        return t(
+            "outages_line", count=s.outages,
+            ago=_fmt_duration(s.last_outage_ago_s), duration=_fmt_duration(s.last_outage_s),
+        )
+
     def _rtt_line(self, with_last: bool = True) -> str:
         s = self.stats
         avg = f"{s.avg_rtt:.0f} ms" if s.avg_rtt is not None else "-"
@@ -429,13 +491,24 @@ class PingTrayApp:
         return line
 
     def _tooltip(self) -> str:
-        # Windows caps the tooltip at 127 characters, so the hourly loss goes without the counts,
-        # and the reasons are dropped if it still doesn't fit (e.g. all three, in Spanish)
-        loss = f"{self._loss_line()} · {t('loss_hour_short', pct=self.stats.history_loss_pct)}"
-        rest = f"\n{loss}\n{self._rtt_line(with_last=False)}"
-        tooltip = self._status_line() + rest
-        if len(tooltip) > 127:
-            tooltip = self._status_line(with_reasons=False) + rest
+        # Windows caps the tooltip at 127 characters: use the most detailed version that fits,
+        # dropping first the reasons, then the hourly loss, then the outages
+        s = self.stats
+        hour = f" · {t('loss_hour_short', pct=s.history_loss_pct)}"
+        if s.outage_ongoing:
+            outages = " · " + t("outage_short_ongoing", duration=_fmt_duration(s.last_outage_s))
+        elif s.outages:
+            outages = " · " + t("outages_short", count=s.outages)
+        else:
+            outages = ""
+        rtt = self._rtt_line(with_last=False)
+        candidates = [
+            (True, hour, outages), (False, hour, outages), (False, "", outages), (False, "", ""),
+        ]
+        for with_reasons, hour_part, outages_part in candidates:
+            tooltip = f"{self._status_line(with_reasons)}\n{self._loss_line()}{hour_part}\n{rtt}{outages_part}"
+            if len(tooltip) <= 127:
+                return tooltip
         return tooltip[:127]
 
     def _peer_items(self):
@@ -472,7 +545,8 @@ class PingTrayApp:
     def _show_version(self, icon, item):
         try:
             icon.notify(
-                f"{self._status_line()}\n{self._loss_line()}\n{self._history_loss_line()}\n{self._rtt_line()}",
+                f"{self._status_line()}\n{self._loss_line()}\n{self._history_loss_line()}\n"
+                f"{self._outages_line()}\n{self._rtt_line()}",
                 f"{APP_NAME} v{__version__}",
             )
         except Exception:
@@ -556,7 +630,7 @@ class PingTrayApp:
     def _refresh(self):
         with self._refresh_lock:
             cfg = self.cfg
-            self.stats = self.samples.stats(cfg["window_minutes"] * 60)
+            self.stats = self.samples.stats(cfg["window_minutes"] * 60, cfg["outage_min_lost"])
             new_state, self.reasons = classify(self.stats, cfg)
             if new_state != self.state:
                 old_state, self.state = self.state, new_state
@@ -565,7 +639,8 @@ class PingTrayApp:
                 if cfg["notify_on_change"] and not (old_state == "gray" and new_state == "green"):
                     try:
                         self.icon.notify(
-                            f"{self._loss_line()}\n{self._history_loss_line()}\n{self._rtt_line()}",
+                            f"{self._loss_line()}\n{self._history_loss_line()}\n"
+                            f"{self._outages_line()}\n{self._rtt_line()}",
                             self._status_line(),
                         )
                     except Exception:
