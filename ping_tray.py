@@ -15,6 +15,8 @@ Configuration lives in config.json next to the script (or next to the .exe).
 
 import ctypes
 import json
+import logging
+import logging.handlers
 import os
 import re
 import socket
@@ -22,7 +24,6 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,8 +35,10 @@ import i18n
 import lan
 from i18n import LocalizedError, t
 
+log = logging.getLogger("ping_tray")
+
 APP_NAME = "Ping Tray"
-__version__ = "0.4.0"  # keep in sync with pyproject.toml
+__version__ = "0.5.0"  # keep in sync with pyproject.toml
 
 # "target" has no default: the host to ping must be set in config.json.
 DEFAULT_CONFIG = {
@@ -56,6 +59,7 @@ DEFAULT_CONFIG = {
     "speedtest_seconds": 5,
     "outage_min_lost": 3,
     "language": "",  # empty = the OS display language
+    "debug_log": False,
 }
 
 LAN_KEYS = ("lan_enabled", "lan_name", "lan_port", "lan_secret")
@@ -77,6 +81,12 @@ MIN_LATENCY_SAMPLES = 10
 # Loss over this longer period is shown alongside the window's, for context only (not used for the color)
 LOSS_HISTORY_S = 3600
 
+# A monitor loop iteration taking longer than this means the PC slept (well above what a slow
+# DNS lookup can block a ping for)
+SLEEP_GAP_S = 60
+# After waking up, lost pings don't count until the first reply or until this time has passed
+RESUME_GRACE_S = 60
+
 SEVERITY = ("green", "yellow", "red")
 
 COLORS = {
@@ -94,6 +104,21 @@ def app_dir() -> Path:
 
 
 CONFIG_PATH = app_dir() / "config.json"
+LOG_PATH = app_dir() / "PingTray.log"
+LOG_MAX_BYTES = 1024 * 1024
+LOG_BACKUPS = 3
+
+
+def setup_logging():
+    """Logs to a rotating file: the .exe has no console, so anything else would be lost."""
+    try:
+        handler = logging.handlers.RotatingFileHandler(
+            LOG_PATH, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8", delay=True,
+        )
+    except OSError:  # e.g. a read-only folder: not worth refusing to run
+        handler = logging.NullHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
 
 
 def load_config(previous: dict | None = None) -> tuple[dict, Exception | None]:
@@ -117,6 +142,7 @@ def load_config(previous: dict | None = None) -> tuple[dict, Exception | None]:
         if cfg["outage_min_lost"] < 1:
             raise LocalizedError("cfg_outage_min_lost")
         cfg["notify_on_change"] = bool(cfg["notify_on_change"])
+        cfg["debug_log"] = bool(cfg["debug_log"])
         if cfg["interval_seconds"] <= 0 or cfg["window_minutes"] <= 0 or cfg["timeout_ms"] <= 0:
             raise LocalizedError("cfg_positive")
         for _, metric in METRICS:
@@ -381,6 +407,10 @@ def _fmt_duration(seconds: float) -> str:
     return f"{seconds // 3600} h {seconds % 3600 // 60} min"
 
 
+def _fmt_ms(ms: float | None) -> str:
+    return f"{ms:.0f} ms" if ms is not None else "-"
+
+
 def _fmt_mbps(mbps: float) -> str:
     return f"{mbps / 1000:.2f} Gbps" if mbps >= 1000 else f"{mbps:.1f} Mbps" if mbps < 10 else f"{mbps:.0f} Mbps"
 
@@ -403,6 +433,7 @@ class PingTrayApp:
     def __init__(self):
         self.cfg, self.config_error = load_config()
         i18n.set_language(self.cfg["language"])
+        self._apply_log_level()
         self.pinger = WindowsPinger() if sys.platform == "win32" else SubprocessPinger()
         self.samples = SampleWindow()
         self.images = {state: make_icon_image(rgb) for state, rgb in COLORS.items()}
@@ -415,6 +446,9 @@ class PingTrayApp:
         self.ping_peer: lan.Peer | None = None  # set by "Ping this peer": overrides the target
         self.peer_results: dict[str, str] = {}  # peer id -> last speed test result
         self.testing: set[str] = set()  # peer ids with a speed test running
+        self._outage_started: float | None = None  # monotonic start of the outage being logged
+        self._settle_until = 0.0  # after waking up, lost pings are ignored until this monotonic time
+        self._settle_ignored = 0  # pings ignored so far
 
         self.icon = pystray.Icon(
             APP_NAME,
@@ -443,6 +477,10 @@ class PingTrayApp:
                 pystray.MenuItem(lambda _: t("menu_quit"), self._quit),
             ),
         )
+
+    def _apply_log_level(self):
+        # On our logger rather than the root one, to leave out the debug output of the libraries
+        log.setLevel(logging.DEBUG if self.cfg["debug_log"] else logging.INFO)
 
     # Menu / tooltip text
 
@@ -562,6 +600,7 @@ class PingTrayApp:
         old_cfg, old_target = self.cfg, self._target()
         self.cfg, self.config_error = load_config(self.cfg)
         i18n.set_language(self.cfg["language"])
+        self._apply_log_level()
         if any(self.cfg[key] != old_cfg[key] for key in LAN_KEYS):
             self._restart_lan()
         if self._target() != old_target:
@@ -632,11 +671,13 @@ class PingTrayApp:
             cfg = self.cfg
             self.stats = self.samples.stats(cfg["window_minutes"] * 60, cfg["outage_min_lost"])
             new_state, self.reasons = classify(self.stats, cfg)
+            self._log_outage(self.stats)
             if new_state != self.state:
                 old_state, self.state = self.state, new_state
+                self._log_color_change(old_state, new_state)
                 self.icon.icon = self.images[new_state]
-                # Skip the expected gray -> green at startup, but report problems found then
-                if cfg["notify_on_change"] and not (old_state == "gray" and new_state == "green"):
+                # Skip going back to gray and the expected gray -> green, but report problems found then
+                if cfg["notify_on_change"] and new_state != "gray" and not (old_state == "gray" and new_state == "green"):
                     try:
                         self.icon.notify(
                             f"{self._loss_line()}\n{self._history_loss_line()}\n"
@@ -648,18 +689,67 @@ class PingTrayApp:
             self.icon.title = self._tooltip()
             self.icon.update_menu()
 
+    def _log_color_change(self, old_state: str, new_state: str):
+        s = self.stats
+        reasons = f" ({', '.join(self.reasons)})" if self.reasons else ""
+        log.info(
+            "Color %s -> %s%s: target=%s, loss %.2f%% (%d/%d), latency %s, jitter %s",
+            old_state, new_state, reasons, self._target(), s.loss_pct, s.lost, s.sent, _fmt_ms(s.avg_rtt), _fmt_ms(s.jitter),
+        )
+
+    def _log_outage(self, s: Stats):
+        now = time.monotonic()
+        if s.outage_ongoing and self._outage_started is None:
+            self._outage_started = now - s.last_outage_s
+            log.info("Outage started %s ago: target=%s", _fmt_duration(s.last_outage_s), self._target())
+        elif not s.outage_ongoing and self._outage_started is not None:
+            if s.outages:
+                # Own start time: the stats only cover the last LOSS_HISTORY_S
+                log.info("Outage ended, lasted %s", _fmt_duration(now - self._outage_started))
+            else:  # its duration is unknown, and the clock may have run through a sleep
+                log.info("Outage no longer tracked: the stats were cleared")
+            self._outage_started = None
+
+    def _ping_target(self, target: str, cfg: dict):
+        rtt = self.pinger.ping(target, cfg["timeout_ms"])
+        now = time.monotonic()
+        if self._settle_until:
+            if rtt is None and now < self._settle_until:
+                self._settle_ignored += 1
+                log.debug("ping %s: lost, ignored after waking up", target)
+                return
+            if rtt is None:
+                log.info("No reply %d s after waking up: counting lost pings again", RESUME_GRACE_S)
+            else:
+                log.info(
+                    "Network back %.1f s after waking up (first reply: %s, %d lost pings ignored)",
+                    RESUME_GRACE_S - (self._settle_until - now), _fmt_ms(rtt), self._settle_ignored,
+                )
+            self._settle_until = 0.0
+        log.debug("ping %s: %s", target, "lost" if rtt is None else _fmt_ms(rtt))
+        self.samples.add(rtt)
+
     def _monitor_loop(self):
         next_run = time.monotonic()
+        last_tick = time.time()  # wall clock: whether monotonic counts sleep depends on the platform
         while not self.stop_event.is_set():
             cfg = self.cfg
             try:
+                now = time.time()
+                if now - last_tick > max(SLEEP_GAP_S, 2 * cfg["interval_seconds"] + cfg["timeout_ms"] / 1000):
+                    # Woke up: start over, as the network needs a moment to come back
+                    log.info("Woke up after %s: stats cleared", _fmt_duration(now - last_tick))
+                    self.samples.clear()
+                    self._settle_until = time.monotonic() + RESUME_GRACE_S
+                    self._settle_ignored = 0
+                last_tick = now
                 target = self._target()
                 if target:  # idle until a target is set and settings are reloaded
-                    self.samples.add(self.pinger.ping(target, cfg["timeout_ms"]))
+                    self._ping_target(target, cfg)
                 self._refresh()
             except Exception:
                 # Keep monitoring: if this thread died the icon would freeze on its last color
-                traceback.print_exc()
+                log.exception("Monitor loop iteration failed")
             next_run += cfg["interval_seconds"]
             delay = next_run - time.monotonic()
             if delay < 0:  # the ping took longer than the interval
@@ -673,9 +763,11 @@ class PingTrayApp:
         threading.Thread(target=self._monitor_loop, daemon=True).start()
 
     def run(self):
+        log.info("%s v%s started: target=%s", APP_NAME, __version__, self._target() or "(none)")
         try:
             self.icon.run(setup=self._setup)
         finally:
+            log.info("%s stopped", APP_NAME)
             self.stop_event.set()
             if self.lan_node is not None:
                 self.lan_node.stop()
@@ -683,4 +775,5 @@ class PingTrayApp:
 
 
 if __name__ == "__main__":
+    setup_logging()
     PingTrayApp().run()

@@ -63,6 +63,7 @@ uv run --gui-script ping_tray.py   # --gui-script = pythonw, no console window
 | `speedtest_seconds`    | `5`       | Duration of each direction of a speed test (max 30)    |
 | `language`             | `""`      | `en` or `es`; empty = the Windows display language     |
 | `outage_min_lost`      | `3`       | Consecutive lost pings that count as an outage         |
+| `debug_log`            | `false`   | Also log every ping to `PingTray.log` (see Logs)       |
 
 `target` has no default and must be set. If `config.json` doesn't exist, it is created with an
 empty `target`; until you fill it in, the icon stays gray, nothing is pinged and the menu shows
@@ -103,6 +104,12 @@ the sample count of a full window (300). That way a single lost packet in the fi
 doesn't turn the icon red, but a full outage does within ~7 seconds. The tooltip still shows
 the actual loss %. Latency and jitter are evaluated only after 10 replies, so a slow first
 ping doesn't affect the color.
+
+**Waking from sleep.** The network takes a moment to come back after the PC wakes up, and those
+lost pings say nothing about the connection. So when the monitor notices it was paused for over
+a minute, it starts over like at startup: the stats are cleared (including the last hour's), the
+icon goes gray without a notification, and lost pings don't count until the first reply. If
+there is no reply within 60 s, it's a real outage and they count again.
 
 ## Languages
 
@@ -154,6 +161,16 @@ so you can test against it from the menu, and vice versa. It's also handy to dia
 network: if the console node sees no peers, the problem is the firewall or the broadcast,
 not the tray app. On the same PC the speeds are meaningless (the traffic never leaves the
 machine).
+
+## Logs
+
+The tray app logs to `PingTray.log`, next to the `.exe` (or `ping_tray.py`): start and stop,
+wake-ups (how long the PC slept and how long the network took to come back), color changes with
+their reason, outages with their duration, and errors. It rotates at 1 MB and keeps 3 backups, so
+it never takes more than 4 MB. The console node (`lan.py`) logs to the console instead.
+
+Set `debug_log` to `true` and use **Reload settings** to also log every ping. That is about 5 MB
+a day at the default interval, so the files only cover the last several hours.
 
 ## Start with Windows
 

@@ -22,11 +22,14 @@ machine on the LAN can't keep it busy indefinitely.
 
 import hmac
 import json
+import logging
 import socket
 import threading
 import time
 import uuid
 from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
 
 PROTOCOL = 1
 BEACON_INTERVAL_S = 60.0
@@ -331,12 +334,13 @@ def _main():
     parser.add_argument("--test", metavar="PEER", help="run a speed test against PEER (name or IP) and exit")
     parser.add_argument("--seconds", type=float, default=5, help="seconds per direction (default: 5)")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S", stream=sys.stdout)
 
     node = LanNode(args.name, args.port, args.secret, "cli")
     node.start()
     if node.error:
         sys.exit(f"LAN disabled: {node.error}")
-    print(f"{args.name}: discovery on UDP {args.port}, speed tests on TCP {node.tcp_port}. Ctrl+C to quit.", flush=True)
+    log.info("%s: discovery on UDP %s, speed tests on TCP %s. Ctrl+C to quit.", args.name, args.port, node.tcp_port)
     try:
         if args.test:
             wanted = args.test.lower()
@@ -350,20 +354,19 @@ def _main():
                     sys.exit(f"Peer {args.test!r} not found. Peers seen: {names}")
                 time.sleep(0.5)
             peer = match[0]
-            print(f"Testing {peer.name} ({peer.addr}:{peer.port}), {args.seconds:g} s per direction...", flush=True)
+            log.info("Testing %s (%s:%s), %g s per direction...", peer.name, peer.addr, peer.port, args.seconds)
             try:
                 result = speed_test(peer, args.seconds, args.secret)
             except (OSError, ValueError, KeyError) as e:
                 sys.exit(f"Test failed: {e}")
-            print(f"Down: {result.down_mbps:.1f} Mbps · Up: {result.up_mbps:.1f} Mbps")
+            log.info("Down: %.1f Mbps · Up: %.1f Mbps", result.down_mbps, result.up_mbps)
             return
         seen: list[tuple[str, str, int]] = []
-        while True:  # print the peer list whenever it changes
+        while True:  # log the peer list whenever it changes
             current = [(p.name, p.addr, p.port) for p in node.peers()]
             if current != seen:
                 seen = current
-                print(time.strftime("%H:%M:%S"), "peers:",
-                      ", ".join(f"{n} ({a}:{p})" for n, a, p in current) or "none", flush=True)
+                log.info("peers: %s", ", ".join(f"{n} ({a}:{p})" for n, a, p in current) or "none")
             time.sleep(1)
     except KeyboardInterrupt:
         pass

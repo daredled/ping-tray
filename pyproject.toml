@@ -1,6 +1,6 @@
 [project]
 name = "ping-tray"
-version = "0.4.0"
+version = "0.5.0"
 description = "Windows tray icon that shows packet loss, latency and jitter to a host."
 readme = "README.md"
 license = "MIT"
